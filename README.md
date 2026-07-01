@@ -38,7 +38,7 @@ Formula crops are verification/reference assets only; formulas must still be tra
 
 ## Usage
 
-In Trae AI, invoke the skill when converting research PDFs to LaTeX:
+Invoke the skill when converting research PDFs to LaTeX:
 
 ```
 Convert paper "12 - Author - Title.pdf" to LaTeX using the template at <template_path>
@@ -94,4 +94,4 @@ This project is open source and available under the MIT License.
 
 ## Acknowledgments
 
-Built for research paper processing workflows in Trae AI.
+Built for research paper processing workflows.
