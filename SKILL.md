@@ -20,6 +20,45 @@ Use this skill when the user asks to convert one or more research-paper PDFs int
 - It is allowed to use local PDF rendering/text extraction/cropping tools such as PyMuPDF to render pages, inspect embedded text, extract block coordinates, and crop visual regions. These tools support traceability; they do not replace visual/manual reasoning.
 - For content completeness, process the paper by logical sections after page-level extraction. Never replace a section with a short paraphrase or compressed summary.
 
+## Bundled Code Tools
+
+This skill ships reusable, parameterized Python tools under `scripts/`. They encode the proven extraction/repair logic so each new paper does not require rewriting throwaway per-paper scripts. Prefer these tools over ad-hoc inline scripts; fall back to custom code only for paper-specific edge cases.
+
+Requirements: Python with `PyMuPDF` (`fitz`); `formula_crops.py` also needs `Pillow` and `numpy`.
+
+All tools take a `--pdf` and an `--out` (the paper's output directory) and print a JSON summary. `--out` must already contain `_section_source_blocks.json` for the formula/repair tools, which is produced by `extract_pdf.py`.
+
+- `scripts/pdf_common.py` — shared helpers (ligature/control-char cleaning, page-derived column detection, equation-number anchor detection, math-vs-prose classification, bbox math, line extraction). Imported by the other tools; not run directly. Page geometry is derived per page, so it is not tied to a specific page size.
+- `scripts/extract_pdf.py` — Stage 1. Renders `pages/page_XX.png` and writes the source map `_section_source_blocks.json`, plus `_raw_text.txt`, `_blocks.txt`, `_summary.json`, and `_embedded_images.json` (catalog of embedded raster images for figure-extraction reference).
+  ```powershell
+  python scripts/extract_pdf.py --pdf "<paper>.pdf" --out "<out_dir>" --zoom 2.2
+  ```
+- `scripts/figure_crops.py` — Stage 2 (figures). Batch-crops figure regions from rendered pages using explicit PDF-point coordinates. Use this when figures are vector graphics (axes/labels are text, not embedded images). Provide a JSON defs file with page, bbox, name, caption, and label for each figure. Writes `figures/` and `figures/_crop_manifest.json`.
+  ```powershell
+  python scripts/figure_crops.py --pdf "<paper>.pdf" --out "<out_dir>" --defs "<figure_defs>.json" --zoom 3.0
+  ```
+- `scripts/formula_crops.py` — Stage 2. Regenerates optimized formula crops using equation-number anchors, line-level math clustering, stop-at-prose expansion, and image-ink trimming; writes `formula_crops/` and `_formula_manifest.json`; validates against the expected equation range and reports missing/suspicious crops.
+  ```powershell
+  python scripts/formula_crops.py --pdf "<paper>.pdf" --out "<out_dir>" --max-eq 72 --columns 2 --scale 5 --last-page 13
+  ```
+- `scripts/formula_text.py` — Stage 2b. Exports `_formula_text_candidates.json` (the text lines inside each equation crop) to assist manual editable-LaTeX transcription. It is a transcription aid only, never a recognizer; combine it with the rendered crop and `pdftotext -layout` output.
+  ```powershell
+  python scripts/formula_text.py --pdf "<paper>.pdf" --out "<out_dir>" --max-eq 72 --columns 2 --last-page 13
+  ```
+- `scripts/repair_paragraphs.py` — Stage 3. Joins false paragraph breaks across column/page transitions in section drafts, moving interrupting page comments to safe boundaries and de-hyphenating line-break hyphens. Line-break hyphens are removed (`indus-` + `trial` -> `industrial`) while genuine compound hyphens are protected (`anti-` + `spoofing` -> `anti-spoofing`). It skips content inside math environments (`equation`/`align`/`aligned`/...). Always run `--dry-run` first to preview findings; pass `--report` to save the findings JSON for the report.
+  ```powershell
+  python scripts/repair_paragraphs.py --sections "<out_dir>/section_drafts" --dry-run
+  python scripts/repair_paragraphs.py --sections "<out_dir>/section_drafts" --report "<out_dir>/_paragraph_repair.json"
+  ```
+
+Tool usage rules:
+- These tools support traceability and repair; they do not replace visual/manual reasoning or the section-by-section completeness workflow.
+- Formula crops produced by `formula_crops.py` are verification/reference assets only. Formulas must still be transcribed to editable LaTeX; keep crop paths in `% TODO: verify equation ...` comments, not as displayed `\includegraphics`.
+- After running `formula_crops.py`, confirm `missing_equations` is empty and resolve any `suspicious_size_equations` before trusting the crops.
+- After running `repair_paragraphs.py`, re-run `--dry-run` to confirm no suspicious breaks remain, then recompile.
+- Record each tool's reported counts (crops, missing equations, joins, moved page comments) in `extraction_report.md`.
+- The tools contain no paper-specific constants. Do not hard-code titles, equation counts, or column splits into the shared scripts; pass them via CLI flags per paper.
+
 ## Required Output Structure
 
 For each source PDF, create:
@@ -44,6 +83,7 @@ _blocks.txt
 _section_source_blocks.txt
 _section_source_blocks.json
 _summary.json
+_embedded_images.json
 paper_name.tex              # optional human-readable wrapper if filename is safe
 ```
 
@@ -75,22 +115,24 @@ Before extraction:
 
 ## LaTeX Template Support
 
-If the user provides a template path, an existing `.tex` template, or asks to use a journal/conference template:
+The skill is template-agnostic: it must adapt to whatever template the user specifies (journal, conference, thesis, report, or a custom class), not to any single fixed template. If the user provides a template path, an existing `.tex` template, or asks to use a specific template:
 
-1. Read the template before writing the output.
-2. Preserve the template's document class, packages, metadata structure, bibliography style, and required environments.
+1. Read the template before writing the output, and identify its document class, required packages, metadata commands, sectioning commands, bibliography style, and any special environments (e.g. custom title/author/abstract/keyword/biography macros).
+2. Preserve the template's document class, packages, metadata structure, bibliography style, and required environments. Do not substitute a different class or a generic preamble when a template is given.
 3. Insert extracted content into the appropriate location, usually after `\begin{document}` and before bibliography/end matter.
 4. Do not overwrite template-specific commands unless necessary.
-5. Map extracted fields to template fields:
-   - Title -> template title command, e.g. `\title{}` or journal-specific equivalent.
-   - Authors -> `\author{}` or template author block.
-   - Abstract -> template abstract environment.
-   - Keywords -> template keyword command/environment.
-   - Sections -> template sectioning commands.
-   - Figures/tables -> template-compatible environments.
-6. If the template has class/style dependencies, copy only necessary `.cls`, `.sty`, bibliography style, or asset files into the output directory.
+5. Map extracted fields to the template's own field commands rather than assuming any fixed macro names:
+   - Title -> the template's title command.
+   - Authors/affiliations -> the template's author/affiliation block.
+   - Abstract -> the template's abstract environment or command.
+   - Keywords/index terms -> the template's keyword command/environment if it has one; otherwise use a plain fallback and note it.
+   - Sections/subsections -> the template's sectioning commands.
+   - Figures/tables -> template-compatible float environments.
+   - Author biographies/end matter -> the template's biography or end-matter environment if present; otherwise keep the text and note the missing environment.
+6. If the template has class/style dependencies, copy only the necessary `.cls`, `.sty`, bibliography style, or asset files into the output directory so the short entry compiles locally.
 7. If the template conflicts with required packages, prefer the template and record package conflicts in `extraction_report.md`.
-8. If no template is provided, use a minimal article-style preamble:
+8. Record the template name/path and the specific template fields/environments used in `extraction_report.md`.
+9. If no template is provided, use a minimal article-style preamble:
 
 ```tex
 \documentclass{article}
@@ -113,6 +155,8 @@ If the user provides a template path, an existing `.tex` template, or asks to us
 ### 1. Initialize Project Directory
 
 For each PDF:
+
+> Tip: `scripts/extract_pdf.py` performs the render + source-map steps below in one call. Use it instead of writing a per-paper extraction script.
 
 1. Derive `paper_name` from the PDF filename without extension.
 2. Create:
@@ -176,6 +220,8 @@ For multi-column pages and page boundaries, always run a final-line continuity p
 #### Continuity Repair Pass for Existing Drafts
 
 When the user reports that paragraphs were not merged across column/page transitions, or when final validation finds false blank paragraphs, run an explicit repair pass instead of making ad-hoc edits only.
+
+> Tool: `scripts/repair_paragraphs.py` implements this pass. Run it with `--dry-run` first to review findings, then without to apply, and re-run `--dry-run` to confirm none remain.
 
 1. Use the structured block map (`_section_source_blocks.json` or equivalent) and generated section drafts as the source of truth.
 2. Scan section drafts for suspicious breaks, including:
@@ -358,6 +404,8 @@ For each displayed formula:
 
 When formula crops are wrong, clipped, overly broad, or missing equation numbers, perform a dedicated formula re-cropping pass.
 
+> Tool: `scripts/formula_crops.py` implements steps 1--9 below (anchor detection, line clustering, stop-at-prose expansion, ink trimming, manifest + range validation). Use `scripts/formula_text.py` to export text candidates that aid editable-LaTeX transcription of each cropped equation.
+
 1. Rebuild formula crops from PDF coordinates, not from guessed vertical bands.
 2. Use equation-number anchors and nearby math-font/text blocks to define local crop bounds. Detect anchors in all common positions:
    - standalone equation numbers such as `(12)`;
@@ -433,9 +481,32 @@ For every equation, verify:
 
 For every figure, plot, block diagram, architecture diagram, photo, flowchart, or schematic:
 
-1. Crop the original visual region using the crop boundary quality gate.
-2. Save as `figures/fig_01.png`, `figures/fig_02.png`, etc.
-3. Insert at the corresponding reading-order location:
+### Important: Vector vs. Raster Figures
+Many academic PDFs contain figures rendered as vector graphics (axes, labels, and lines drawn with vector primitives, not embedded bitmaps). In such cases:
+- `page.get_images()` will only find embedded raster images (like photos or heatmaps), not the full figure.
+- The figure's axes labels, tick marks, and legends are **text** in the PDF, not part of a single image.
+- You must crop the **entire figure region** from the rendered page image using `page.get_pixmap(clip=rect)`.
+
+### Figure Cropping Best Practices
+1. **Always inspect the full page image first** (`pages/page_XX.png`) before deciding crop coordinates. Do not guess.
+2. **Crop only the chart body** — include axes, labels, data, and legend, but **do NOT include the figure caption** ("Fig. X. ..."). The caption belongs in `\caption{}` in LaTeX.
+3. **Include all axis labels and tick marks** — it is better to have a small amount of extra whitespace than to cut off axis labels.
+4. **For two-column papers**, figures typically fit within a single column width. Full-width figures span both columns.
+5. **Verify after cropping**: open the saved figure and check:
+   - Top: no axis labels or titles are cut off
+   - Bottom: x-axis label and all tick marks are present
+   - Left: y-axis label and all tick marks are present
+   - Right: no stray text from the next column is included
+   - No caption text ("Fig.") is included in the crop
+
+### Figure Cropping Workflow
+1. Identify the page and approximate column position of each figure from the rendered page image.
+2. Locate the figure caption ("Fig. X.") to find the bottom boundary of the figure.
+3. Work upward from the caption to find the top of the figure (usually the top axis or title).
+4. Determine left/right boundaries from the outermost axis labels or plot edges.
+5. Crop with a small padding (5-10 points) to avoid clipping.
+6. Save as `figures/fig_01.png`, `figures/fig_02.png`, etc.
+7. Insert at the corresponding reading-order location:
 
 ```tex
 \begin{figure}[htbp]
@@ -446,19 +517,62 @@ For every figure, plot, block diagram, architecture diagram, photo, flowchart, o
 \end{figure}
 ```
 
-4. Preserve original figure number and caption text.
-5. If readable, add a concise visual-content comment.
-6. If association or boundary is uncertain, add `% TODO: verify figure-caption association on page <page_number>`.
+8. Preserve original figure number and caption text exactly as it appears in the PDF.
+9. If association or boundary is uncertain, add `% TODO: verify figure-caption association on page <page_number>`.
+10. Maintain `figures/_crop_manifest.json` with page, bbox, label, caption, crop basis, and confidence.
+
+> Tool hint: No bundled script currently automates figure cropping for vector-graphics figures. Use PyMuPDF's `page.get_pixmap(matrix=..., clip=rect)` directly with coordinates derived from visual inspection of `pages/page_XX.png`. Start with conservative estimates and iteratively refine.
 
 ## Table Extraction
 
 For tables:
 
-1. Attempt editable LaTeX `table` + `tabular` first for simple tables.
-2. Prefer `booktabs` style.
-3. Use `??` for uncertain cells and add a TODO.
-4. For dense tables, checkmark/cross tables, multi-row tables, or visually complex tables, retain a screenshot and optionally provide a partial editable version only if reliable:
+### Core Principle: Prefer Editable LaTeX Over Screenshots
+Always convert tables to editable LaTeX `tabular` environments when possible. Screenshot tables are a last resort. Editable tables are searchable, accessible, and match the template typography.
 
+### Table Classification and Strategy
+| Table Type | Recommended Approach |
+|---|---|
+| Simple tables (few rows/columns, plain text) | Full editable `tabular` |
+| Medium tables with numbers/symbols | Full editable `tabular` with `$...$` for math |
+| Dense tables with many columns | Editable `tabular` + `\resizebox{\linewidth}{!}{...}` |
+| Complex multi-row/multi-column tables | Editable `tabular` with `\multirow`/`\multicolumn` |
+| Tables with images or very complex layout | Screenshot + optional partial editable version |
+
+### Editable Table Best Practices
+1. **Prefer `booktabs` style** when the template supports it; otherwise use standard `\hline`.
+2. **Use `\renewcommand{\arraystretch}{1.3}`** to improve row spacing for readability.
+3. **For wide tables in two-column layouts**, use `\resizebox{\linewidth}{!}{...}` to scale to column width.
+4. **Use `\centering`** inside `table` environment.
+5. **Preserve exact text** from the original table cells, including symbols, abbreviations, and references.
+6. **Table numbering** matches the original paper; use `\label{tab:table_XX}` for cross-references.
+7. **Use `??` for uncertain cells** and add a `% TODO` comment above the table.
+
+### Example: Simple Editable Table
+```tex
+\begin{table}[htbp]
+\renewcommand{\arraystretch}{1.3}
+\caption{<table title>}
+\label{tab:table_01}
+\centering
+\begin{tabular}{c l r}
+\hline
+\textbf{Column 1} & \textbf{Column 2} & \textbf{Column 3}\\
+\hline
+Item 1 & Description & 123\\
+Item 2 & Another description & 456\\
+\hline
+\end{tabular}
+\end{table}
+```
+
+### When to Use Screenshot Tables
+Use screenshots only when:
+- The table has embedded images or complex graphical elements
+- The table uses highly customized formatting that would take excessive time to reproduce
+- The table content is not readable from embedded text (e.g., scanned PDF)
+
+For screenshot tables:
 ```tex
 \begin{table}[htbp]
     \centering
@@ -469,9 +583,11 @@ For tables:
 \end{table}
 ```
 
-5. For tables converted to editable `tabular`, still keep the table crop as a verification asset when feasible.
-6. Record all screenshot-only or partially editable tables in `extraction_report.md`.
-7. When a table interrupts prose in the source page, do not splice table text into the prose. Place the table as a float and reconnect the prose before/after it only when the sentence continuation is visually clear.
+### Additional Table Rules
+- For tables converted to editable `tabular`, still keep the table crop as a verification asset when feasible.
+- Record all screenshot-only or partially editable tables in `extraction_report.md`.
+- When a table interrupts prose in the source page, do not splice table text into the prose. Place the table as a float and reconnect the prose before/after it only when the sentence continuation is visually clear.
+- Table headers ("Table X" or "TABLE X") are part of the caption, not part of the crop. Use `\caption{}`.
 
 ## Algorithms and Pseudocode
 
